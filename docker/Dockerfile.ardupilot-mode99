@@ -1,0 +1,42 @@
+# Dockerfile for ArduPilot with Mode 99 (Pure LQR Control)
+# Based on official ArduPilot development image
+
+FROM ardupilot/ardupilot-dev-chibios:latest
+
+LABEL description="ArduPilot SITL with Mode 99 (LQR State Feedback Control)"
+LABEL maintainer="Autonomous Drone Sim Project"
+
+# Set working directory
+WORKDIR /ardupilot
+
+# Clone ArduPilot if not mounted
+RUN if [ ! -d "/ardupilot/.git" ]; then \
+        git clone --recurse-submodules https://github.com/ArduPilot/ardupilot.git /ardupilot && \
+        cd /ardupilot && \
+        git checkout Copter-4.3; \
+    fi
+
+# Copy Mode 99 files from build context
+COPY mode_smartphoto99.h /ardupilot/ArduCopter/
+COPY mode_smartphoto99.cpp /ardupilot/ArduCopter/
+COPY sysid_params.txt /ardupilot/ArduCopter/
+
+# Configure and build for SITL
+RUN cd /ardupilot && \
+    ./waf configure --board sitl && \
+    ./waf copter
+
+# Install Python dependencies for testing
+RUN pip3 install pymavlink
+
+# Create entrypoint script
+RUN echo '#!/bin/bash' > /entrypoint.sh && \
+    echo 'cd /ardupilot/ArduCopter' >> /entrypoint.sh && \
+    echo 'exec ../Tools/autotest/sim_vehicle.py "$@"' >> /entrypoint.sh && \
+    chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["--console", "--map", "-I0"]
+
+# Expose MAVLink ports
+EXPOSE 5760 5761 5762 5763 14550 14551

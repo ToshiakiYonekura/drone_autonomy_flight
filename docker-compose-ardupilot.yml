@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  # ArduPilot SITL in Docker for Mode 99 testing
+  ardupilot-sitl:
+    image: ardupilot/ardupilot-dev-chibios:latest
+    container_name: ardupilot_sitl
+    network_mode: "host"
+    privileged: true
+    environment:
+      - DISPLAY=${DISPLAY}
+      - VEHICLE=ArduCopter
+    volumes:
+      - ~/ardupilot:/ardupilot
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    working_dir: /ardupilot/ArduCopter
+    command: >
+      bash -c "
+      ../Tools/autotest/sim_vehicle.py
+      --console
+      --map
+      --no-rebuild
+      -I0
+      "
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+  # MAVProxy for manual testing
+  mavproxy:
+    image: ardupilot/ardupilot-dev-chibios:latest
+    container_name: mavproxy
+    network_mode: "host"
+    depends_on:
+      - ardupilot-sitl
+    command: >
+      bash -c "
+      sleep 10 &&
+      mavproxy.py
+      --master=tcp:127.0.0.1:5760
+      --out=udp:127.0.0.1:14550
+      --console
+      --map
+      "
+    stdin_open: true
+    tty: true

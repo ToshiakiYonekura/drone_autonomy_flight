@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  ardupilot-sitl:
+    image: ardupilot/ardupilot-dev-ros:latest
+    container_name: ardupilot-sitl
+    network_mode: "host"
+    volumes:
+      - ~/ardupilot:/ardupilot
+      - ~/autonomous_drone_sim:/workspace
+    working_dir: /ardupilot/ArduCopter
+    command: >
+      bash -c "
+      ../Tools/autotest/sim_vehicle.py -v ArduCopter
+      --no-mavproxy
+      --console
+      --map
+      "
+    environment:
+      - DISPLAY=${DISPLAY}
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+
+# Usage:
+# docker-compose -f docker-compose-sitl.yml up
+# docker-compose -f docker-compose-sitl.yml down

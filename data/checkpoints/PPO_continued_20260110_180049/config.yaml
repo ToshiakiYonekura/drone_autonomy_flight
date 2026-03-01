@@ -1,0 +1,8 @@
+checkpoint_path: data/checkpoints/PPO_20251228_162953/best/best_model.zip
+continued_timesteps: 1000000
+env_id: PyBulletDrone-v0
+learning_rate: 0.0003
+n_envs: 8
+seed: 42
+starting_timesteps: 770000
+timestamp: '20260110_180049'

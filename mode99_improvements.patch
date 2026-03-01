@@ -1,0 +1,134 @@
+--- mode_smartphoto99.h.orig	2026-02-08 17:47:00.000000000 +0000
++++ mode_smartphoto99.h	2026-02-15 12:00:00.000000000 +0000
+@@ -54,6 +54,16 @@
+     } safety_state;
+
+     // Safety configuration parameters
++    // LQR thrust limits
++    static constexpr float MIN_THRUST_RATIO = 0.3f;    // 30% of hover thrust
++    static constexpr float MAX_THRUST_RATIO = 1.7f;    // 170% of hover thrust
++
++    // Moment limits (N·m)
++    static constexpr float MAX_ROLL_MOMENT_NM = 50.0f;
++    static constexpr float MAX_PITCH_MOMENT_NM = 50.0f;
++    static constexpr float MAX_YAW_MOMENT_NM = 20.0f;
++
++    // Original safety parameters
+     static constexpr uint32_t COMPANION_TIMEOUT_MS = 5000;   // 5 second heartbeat timeout
+     static constexpr float BATTERY_LOW_PERCENT = 30.0f;      // Low battery warning
+     static constexpr float BATTERY_CRITICAL_PERCENT = 20.0f; // Force landing
+@@ -66,6 +76,12 @@
+
+         // Motor configuration
+         float motor_kv;                // KV value
++
++        // Parameter validation ranges
++        static constexpr float MIN_ARM_LENGTH = 0.05f;   // 5cm minimum
++        static constexpr float MAX_ARM_LENGTH = 1.0f;    // 1m maximum
++        static constexpr float MIN_MOMENT_COEFF = 0.005f; // 0.5cm minimum
++        static constexpr float MAX_MOMENT_COEFF = 0.05f;  // 5cm maximum
+         float max_thrust_per_motor;    // Max thrust per motor
+         float arm_length;              // Distance from center to motor (m)
+         float moment_coefficient;      // Torque/thrust ratio (m)
+
+--- mode_smartphoto99.cpp.orig	2026-02-08 17:47:00.000000000 +0000
++++ mode_smartphoto99.cpp	2026-02-15 12:00:00.000000000 +0000
+@@ -953,10 +953,24 @@
+     const float L = sysid_data.arm_length;        // Moment arm (m)
+     const float kM = sysid_data.moment_coefficient; // Torque/thrust ratio (m)
+
+-    // Safety check
+-    if (L <= 0.0f || kM <= 0.0f) {
+-        gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Using default motor mixing params");
++    // IMPROVED: Safety check with ranges
++    bool params_invalid = false;
++    float L_safe = L;
++    float kM_safe = kM;
++
++    if (L <= 0.0f || L < SysidData::MIN_ARM_LENGTH || L > SysidData::MAX_ARM_LENGTH) {
++        gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Invalid ARM_LENGTH %.3f, using default", L);
++        L_safe = 0.225f;  // Default
++        params_invalid = true;
++    }
++
++    if (kM <= 0.0f || kM < SysidData::MIN_MOMENT_COEFF || kM > SysidData::MAX_MOMENT_COEFF) {
++        gcs().send_text(MAV_SEVERITY_WARNING, "MODE99: Invalid MOMENT_COEFF %.3f, using default", kM);
++        kM_safe = 0.016f;  // Default
++        params_invalid = true;
++    }
++
++    if (params_invalid) {
+         for (int i = 0; i < 4; i++) {
+             motor_thrust[i] = F_total / 4.0f;
+         }
+@@ -964,10 +978,10 @@
+     }
+
+     // X-configuration motor mixing
+-    // Thrust distribution + moment allocation
+     float F_base = F_total / 4.0f;
++    const float L_eff = L_safe;
++    const float kM_eff = kM_safe;
+
+-    // Motor 0 (Front-Left): +Roll axis, +Pitch axis
+     motor_thrust[0] = F_base - M_roll / (4.0f * L) - M_pitch / (4.0f * L) + M_yaw / (4.0f * kM);
+
+     // Motor 1 (Front-Right): -Roll axis, +Pitch axis
+@@ -1061,9 +1075,9 @@
+     control_output[3] -= lqr_gains.K[3][j] * state_error[j];
+
+     // Apply safety limits
+-    float min_thrust = hover_thrust_N * 0.3f;
+-    float max_thrust = hover_thrust_N * 1.7f;
+-    control_output[0] = constrain_float(control_output[0], min_thrust, max_thrust);
++    // IMPROVED: Use named constants
++    float min_thrust = hover_thrust_N * MIN_THRUST_RATIO;
++    float max_thrust = hover_thrust_N * MAX_THRUST_RATIO;
++    control_output[0] = constrain_float(control_output[0], min_thrust, max_thrust);
+
+-    float max_roll_moment = 50.0f;   // N·m
+-    float max_pitch_moment = 50.0f;  // N·m
+-    float max_yaw_moment = 20.0f;    // N·m
+-    control_output[1] = constrain_float(control_output[1], -max_roll_moment, max_roll_moment);
+-    control_output[2] = constrain_float(control_output[2], -max_pitch_moment, max_pitch_moment);
+-    control_output[3] = constrain_float(control_output[3], -max_yaw_moment, max_yaw_moment);
++    // IMPROVED: Use named constants
++    control_output[1] = constrain_float(control_output[1], -MAX_ROLL_MOMENT_NM, MAX_ROLL_MOMENT_NM);
++    control_output[2] = constrain_float(control_output[2], -MAX_PITCH_MOMENT_NM, MAX_PITCH_MOMENT_NM);
++    control_output[3] = constrain_float(control_output[3], -MAX_YAW_MOMENT_NM, MAX_YAW_MOMENT_NM);
+
+@@ -1108,14 +1122,18 @@
+-    // Telemetry for monitoring (Pure LQR)
+-    gcs().send_named_float("LQR_Thrust", control_output[0]);     // Total thrust [N]
+-    gcs().send_named_float("LQR_M_roll", control_output[1]);     // Roll moment [N·m]
+-    gcs().send_named_float("LQR_M_pitch", control_output[2]);    // Pitch moment [N·m]
+-    gcs().send_named_float("LQR_M_yaw", control_output[3]);      // Yaw moment [N·m]
++    // IMPROVED: Reduce telemetry overhead - send at 20 Hz instead of 100 Hz
++    // Always send critical data
++    gcs().send_named_float("LQR_Thrust", control_output[0]);
++
++    // Send detailed telemetry every 5th iteration (20 Hz)
++    if (state_feedback_counter % 5 == 0) {
++        gcs().send_named_float("LQR_M_roll", control_output[1]);
++        gcs().send_named_float("LQR_M_pitch", control_output[2]);
++        gcs().send_named_float("LQR_M_yaw", control_output[3]);
++
+-    gcs().send_named_float("LQR_Motor0", motor_thrust[0]);       // Motor thrust [N]
+-    gcs().send_named_float("LQR_Motor1", motor_thrust[1]);
+-    gcs().send_named_float("LQR_Motor2", motor_thrust[2]);
+-    gcs().send_named_float("LQR_Motor3", motor_thrust[3]);
+-    gcs().send_named_float("LQR_PWM0", (float)motor_pwm[0]);     // Motor PWM
+-    gcs().send_named_float("LQR_PWM1", (float)motor_pwm[1]);
+-    gcs().send_named_float("LQR_PWM2", (float)motor_pwm[2]);
+-    gcs().send_named_float("LQR_PWM3", (float)motor_pwm[3]);
++        gcs().send_named_float("LQR_Motor0", motor_thrust[0]);
++        gcs().send_named_float("LQR_Motor1", motor_thrust[1]);
++        gcs().send_named_float("LQR_Motor2", motor_thrust[2]);
++        gcs().send_named_float("LQR_Motor3", motor_thrust[3]);
++        gcs().send_named_float("LQR_PWM0", (float)motor_pwm[0]);
++        gcs().send_named_float("LQR_PWM1", (float)motor_pwm[1]);
++        gcs().send_named_float("LQR_PWM2", (float)motor_pwm[2]);
++        gcs().send_named_float("LQR_PWM3", (float)motor_pwm[3]);
++    }
+
+     // Report execution every second
