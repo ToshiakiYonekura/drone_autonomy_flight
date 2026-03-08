@@ -212,31 +212,16 @@ class ArduPilotMode99Env(gym.Env):
         self.episode_reward = 0.0
         self.prev_action = np.zeros(4)
 
-        # Set random goal position (within bounds)
-        if self.mission_type == 'obstacle_avoidance':
-            self.goal_position = np.array([
-                np.random.uniform(20, 50),
-                np.random.uniform(-10, 10),
-                -np.random.uniform(5, 15)
-            ])
-        else:  # waypoint_navigation
-            self.goal_position = np.array([
-                np.random.uniform(-50, 50),
-                np.random.uniform(-50, 50),
-                -np.random.uniform(5, 20)
-            ])
+        # Goal and obstacles are placed after M99_REF capture below,
+        # relative to the drone's actual episode-start position.
 
-        # Generate virtual obstacles for this episode
-        self._obstacles = []
-        if self.enable_obstacles:
-            num_obstacles = self.np_random.integers(3, 9)
-            for _ in range(num_obstacles):
-                self._obstacles.append(self._sample_obstacle())
+        # Refresh data streams each episode (streams degrade over time)
+        self.request_data_streams()
 
         # Disarm if currently armed
         if self.telemetry['armed']:
             self.disarm()
-            time.sleep(1.0)
+            time.sleep(0.2)
 
         # Step 1: Disable pre-arm checks
         self.mav.mav.param_set_send(
@@ -244,7 +229,7 @@ class ArduPilotMode99Env(gym.Env):
             b'ARMING_CHECK', 0,
             mavutil.mavlink.MAV_PARAM_TYPE_INT32
         )
-        ack_deadline = time.time() + 3.0
+        ack_deadline = time.time() + 1.0
         while time.time() < ack_deadline:
             msg = self.mav.recv_match(blocking=True, timeout=0.2)
             if msg and msg.get_type() == 'PARAM_VALUE':
@@ -253,11 +238,12 @@ class ArduPilotMode99Env(gym.Env):
 
         # Step 2: Switch to GUIDED while disarmed
         self.set_mode('GUIDED')
-        time.sleep(0.3)
+        time.sleep(0.1)
 
-        # Step 3: Wait for GPS fix + EKF convergence (up to 40s)
+        # Step 3: Wait for GPS fix + EKF convergence (up to 10s; SITL needs a
+        # few seconds on fresh start to acquire GPS lock)
         print("  Waiting for GPS fix + EKF convergence...")
-        ekf_deadline = time.time() + 40.0
+        ekf_deadline = time.time() + 10.0
         gps_ok = False
         ekf_ok = False
         while time.time() < ekf_deadline and not (gps_ok and ekf_ok):
@@ -282,7 +268,7 @@ class ArduPilotMode99Env(gym.Env):
 
         # Step 4: Arm (force arm, magic 2989)
         self.arm()
-        time.sleep(0.5)
+        time.sleep(0.1)
 
         # Step 5: Takeoff to 5m in GUIDED
         self.takeoff(5.0)
@@ -304,16 +290,25 @@ class ArduPilotMode99Env(gym.Env):
             99
         )
 
-        # Step 7: Capture M99_REF_* initial reference (Mode 99 broadcasts at 1Hz)
-        # Mode 99 companion timeout = 12s, so we have time
+        # Step 7: Capture M99_REF_* while sending hold commands.
+        # With --speedup 5, 10s real = 50s sim >> 12s companion timeout unless we
+        # actively send SET_POSITION_TARGET to keep Mode 99 alive.
         ref_n, ref_e, ref_d = None, None, None
         mode99_ok = False
-        ref_deadline = time.time() + 10.0
+        ref_deadline = time.time() + 5.0
+        hold_pos = fallback_pos if fallback_pos is not None else np.zeros(3)
+        last_cmd_t = 0.0
         print("  Waiting for Mode 99 + M99_REF_* reference...")
         while time.time() < ref_deadline:
             if mode99_ok and ref_n is not None and ref_e is not None and ref_d is not None:
                 break
-            msg = self.mav.recv_match(blocking=True, timeout=0.1)
+            # Send hold command every 0.1s real time (~0.5s sim at speedup 5)
+            # to prevent the 12s companion timeout from triggering LAND failsafe.
+            now = time.time()
+            if now - last_cmd_t >= 0.1:
+                self.send_position_target(position=hold_pos)
+                last_cmd_t = now
+            msg = self.mav.recv_match(blocking=True, timeout=0.05)
             if msg is None:
                 continue
             mt = msg.get_type()
@@ -338,6 +333,28 @@ class ArduPilotMode99Env(gym.Env):
         # Store Mode 99 reference so step() can use it
         self._mode99_ref = np.array([ref_n, ref_e, ref_d], dtype=np.float32)
         print(f"  Mode 99 reference: N={ref_n:.2f} E={ref_e:.2f} D={ref_d:.2f} (alt={-ref_d:.2f}m)")
+
+        # Set goal and obstacles relative to drone's episode-start NE position.
+        # This keeps training consistent regardless of how far the drone drifted
+        # between episodes during LAND mode.
+        origin_ne = self._mode99_ref[:2]
+        if self.mission_type == 'obstacle_avoidance':
+            self.goal_position = np.array([
+                origin_ne[0] + self.np_random.uniform(20, 50),
+                origin_ne[1] + self.np_random.uniform(-10, 10),
+                -self.np_random.uniform(5, 15)
+            ], dtype=np.float32)
+        else:  # waypoint_navigation
+            self.goal_position = np.array([
+                origin_ne[0] + self.np_random.uniform(-50, 50),
+                origin_ne[1] + self.np_random.uniform(-50, 50),
+                -self.np_random.uniform(5, 20)
+            ], dtype=np.float32)
+        self._obstacles = []
+        if self.enable_obstacles:
+            num_obstacles = self.np_random.integers(3, 9)
+            for _ in range(num_obstacles):
+                self._obstacles.append(self._sample_obstacle(origin_ne))
 
         # Update telemetry and start position
         self.update_telemetry()
@@ -498,24 +515,27 @@ class ArduPilotMode99Env(gym.Env):
             'velocity': self.telemetry['velocity'].copy()
         }
 
-    def _sample_obstacle(self) -> tuple:
+    def _sample_obstacle(self, origin_ne: np.ndarray = None) -> tuple:
         """
-        Sample a random vertical-column box obstacle in NED space.
+        Sample a random vertical-column box obstacle relative to origin_ne.
 
-        Obstacles are placed between the start and goal, spanning the full
-        altitude range the drone might fly through (0–20m, i.e. D=0 to D=-20).
+        origin_ne: [N, E] of the drone's episode-start position. Obstacles are
+                   placed relative to this so they remain between the drone and
+                   its goal regardless of where SITL drifted between episodes.
 
         Returns:
             (center, half_size) both as np.ndarray[3] in NED meters
         """
+        if origin_ne is None:
+            origin_ne = np.zeros(2)
         if self.mission_type == 'obstacle_avoidance':
-            goal_n = self.goal_position[0]
-            n = float(self.np_random.uniform(5.0, max(goal_n - 5.0, 6.0)))
-            e = float(self.np_random.uniform(-8.0, 8.0))
+            goal_n_rel = self.goal_position[0] - origin_ne[0]
+            n = float(self.np_random.uniform(5.0, max(goal_n_rel - 5.0, 6.0))) + origin_ne[0]
+            e = float(self.np_random.uniform(-8.0, 8.0)) + origin_ne[1]
         else:
-            n = float(self.np_random.uniform(-45.0, 45.0))
-            e = float(self.np_random.uniform(-45.0, 45.0))
-        # Vertical column: center at 10m altitude (D=-10), spans D=0 to D=-20
+            n = float(self.np_random.uniform(-45.0, 45.0)) + origin_ne[0]
+            e = float(self.np_random.uniform(-45.0, 45.0)) + origin_ne[1]
+        # Vertical column spanning flight altitude range (D=0 to D=-20)
         center = np.array([n, e, -10.0], dtype=np.float32)
         half_size = np.array([1.0, 1.0, 10.0], dtype=np.float32)
         return center, half_size
@@ -659,10 +679,27 @@ class ArduPilotMode99Env(gym.Env):
         print("⚠️ Arm timeout")
 
     def disarm(self):
-        """Disarm the copter"""
+        """Disarm with 5s timeout; force disarm if auto-disarm stalls."""
         self.mav.arducopter_disarm()
-        self.mav.motors_disarmed_wait()
-        print("✅ Disarmed")
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            msg = self.mav.recv_match(type='HEARTBEAT', blocking=True, timeout=0.3)
+            if msg is None:
+                continue
+            if not (msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED):
+                self.telemetry['armed'] = False
+                print("  Disarmed")
+                return
+        # Timeout — force disarm via MAV_CMD (magic 21196)
+        print("  Disarm timeout, sending force disarm")
+        self.mav.mav.command_long_send(
+            self.mav.target_system, self.mav.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 0, 21196, 0, 0, 0, 0, 0
+        )
+        time.sleep(1.5)
+        self.telemetry['armed'] = False
+        print("  Force disarmed")
 
     def takeoff(self, altitude: float):
         """Takeoff to specified altitude"""
