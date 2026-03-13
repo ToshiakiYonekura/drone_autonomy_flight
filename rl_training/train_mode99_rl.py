@@ -8,14 +8,15 @@ Train PPO agent for autonomous obstacle avoidance and waypoint navigation
 import argparse
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 import torch
 import os
 from ardupilot_gym_env import ArduPilotMode99Env
 
 
-def make_env(rank: int, seed: int = 0, mission_type: str = 'obstacle_avoidance'):
+def make_env(rank: int, seed: int = 0, mission_type: str = 'obstacle_avoidance',
+             enable_obstacles: bool = True):
     """
     Create a single environment
 
@@ -23,6 +24,7 @@ def make_env(rank: int, seed: int = 0, mission_type: str = 'obstacle_avoidance')
         rank: Index of the environment
         seed: Random seed
         mission_type: Type of mission
+        enable_obstacles: Whether to include obstacles (False for Phase 1 curriculum)
 
     Returns:
         Function that creates the environment
@@ -32,9 +34,9 @@ def make_env(rank: int, seed: int = 0, mission_type: str = 'obstacle_avoidance')
             sitl_connection=f'tcp:127.0.0.1:{5760 + rank}',
             mission_type=mission_type,
             max_steps=1000,
-            goal_radius=1.0,
+            goal_radius=5.0,
             time_scale=5.0,  # Speed up simulation 5x
-            enable_obstacles=True
+            enable_obstacles=enable_obstacles
         )
         env = Monitor(env)
         env.reset(seed=seed + rank)
@@ -49,7 +51,8 @@ def train_ppo(
     learning_rate: float = 3e-4,
     save_dir: str = './models',
     log_dir: str = './logs',
-    resume_path: str = None
+    resume_path: str = None,
+    enable_obstacles: bool = True
 ):
     """
     Train PPO agent against ArduPilot SITL + Mode 99 LQR.
@@ -84,13 +87,24 @@ def train_ppo(
     print(f"Mission Type: {mission_type}")
     print(f"Total Timesteps: {total_timesteps:,}")
     print(f"Learning Rate: {learning_rate}")
+    print(f"Obstacles: {'enabled' if enable_obstacles else 'disabled (Phase 1 curriculum)'}")
     print(f"SITL connection: tcp:127.0.0.1:5760 (speedup=5 required)")
     print(f"Resume from:  {resume_path if resume_path else 'N/A (new training)'}")
-    print(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+    print(f"Device: CPU (forced — MLP policy runs faster on CPU)")
     print("=" * 60)
 
     # Single training environment (n_envs=1 enforced above)
-    env = DummyVecEnv([make_env(0, mission_type=mission_type)])
+    env = DummyVecEnv([make_env(0, mission_type=mission_type, enable_obstacles=enable_obstacles)])
+    # Normalize rewards to stabilize value function learning.
+    # norm_obs=False: observations have meaningful physical units; don't scale them.
+    # clip_reward=10: cap normalized reward to prevent outliers from destabilizing training.
+    vecnorm_path = f'{save_dir}/ppo_{mission_type}_vecnorm.pkl'
+    if resume_path and os.path.exists(vecnorm_path):
+        print(f"Loading VecNormalize stats from {vecnorm_path}")
+        env = VecNormalize.load(vecnorm_path, env)
+        env.training = True
+    else:
+        env = VecNormalize(env, norm_obs=False, norm_reward=True, clip_reward=10.0)
 
     # Checkpoint only — no separate eval env to avoid MAVLink conflicts.
     # Run `python3 train_mode99_rl.py --mode test --model-path <path>` for evaluation.
@@ -108,7 +122,7 @@ def train_ppo(
             env=env,
             learning_rate=learning_rate,
             tensorboard_log=f'{log_dir}/ppo_{mission_type}',
-            device='auto'
+            device='cpu'
         )
         print(f"Resuming from step {model.num_timesteps:,}")
     else:
@@ -127,7 +141,7 @@ def train_ppo(
             max_grad_norm=0.5,
             verbose=1,
             tensorboard_log=f'{log_dir}/ppo_{mission_type}',
-            device='auto'
+            device='cpu'
         )
 
     # Train
@@ -143,15 +157,18 @@ def train_ppo(
             reset_num_timesteps=not is_resume
         )
 
-        # Save final model
+        # Save final model + VecNormalize stats
         final_model_path = f'{save_dir}/ppo_{mission_type}_final'
         model.save(final_model_path)
+        env.save(vecnorm_path)
         print(f"\n✅ Training complete! Model saved to {final_model_path}")
+        print(f"   VecNormalize stats saved to {vecnorm_path}")
 
     except KeyboardInterrupt:
         print("\n⚠️ Training interrupted by user")
         model.save(f'{save_dir}/ppo_{mission_type}_interrupted')
-        print("Model saved")
+        env.save(vecnorm_path)
+        print("Model and VecNormalize stats saved")
 
     finally:
         env.close()
@@ -249,6 +266,8 @@ if __name__ == '__main__':
                         help='Number of test episodes')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume training from (e.g. models/ppo_obstacle_avoidance_30000_steps.zip)')
+    parser.add_argument('--no-obstacles', action='store_true',
+                        help='Disable obstacles (Phase 1 curriculum: learn goal reaching first)')
 
     args = parser.parse_args()
 
@@ -257,7 +276,8 @@ if __name__ == '__main__':
             mission_type=args.mission,
             total_timesteps=args.timesteps,
             learning_rate=args.lr,
-            resume_path=args.resume
+            resume_path=args.resume,
+            enable_obstacles=not args.no_obstacles
         )
     else:  # test
         if args.model_path is None:

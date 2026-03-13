@@ -27,15 +27,17 @@ LR="3e-4"
 RESUME=""
 SITL_ONLY=false
 NO_REBUILD=""
+NO_OBSTACLES=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
-        --mission)    MISSION="$2";     shift 2 ;;
-        --timesteps)  TIMESTEPS="$2";   shift 2 ;;
-        --lr)         LR="$2";          shift 2 ;;
-        --resume)     RESUME="$2";      shift 2 ;;
-        --sitl-only)  SITL_ONLY=true;   shift ;;
-        --no-rebuild) NO_REBUILD="--no-rebuild"; shift ;;
+        --mission)       MISSION="$2";              shift 2 ;;
+        --timesteps)     TIMESTEPS="$2";            shift 2 ;;
+        --lr)            LR="$2";                   shift 2 ;;
+        --resume)        RESUME="$2";               shift 2 ;;
+        --sitl-only)     SITL_ONLY=true;            shift ;;
+        --no-rebuild)    NO_REBUILD="--no-rebuild"; shift ;;
+        --no-obstacles)  NO_OBSTACLES="--no-obstacles"; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
 done
@@ -121,8 +123,13 @@ echo ""
 cd "$TRAINING_DIR"
 RESUME_ARG=""
 if [ -n "$RESUME" ]; then
-    RESUME_ARG="--resume $RESUME"
-    echo "  Resuming from: $RESUME"
+    # Convert to absolute path (handles both relative-to-workspace and relative-to-rl_training)
+    RESUME_ABS="$(realpath "$WORKSPACE_DIR/$RESUME" 2>/dev/null)"
+    if [ ! -f "$RESUME_ABS" ] && [ ! -f "${RESUME_ABS}.zip" ]; then
+        RESUME_ABS="$(realpath "$RESUME" 2>/dev/null || echo "$RESUME")"
+    fi
+    RESUME_ARG="--resume $RESUME_ABS"
+    echo "  Resuming from: $RESUME_ABS"
 fi
 
 python3 train_mode99_rl.py \
@@ -130,4 +137,5 @@ python3 train_mode99_rl.py \
     --mission "$MISSION" \
     --timesteps "$TIMESTEPS" \
     --lr "$LR" \
-    $RESUME_ARG
+    $RESUME_ARG \
+    $NO_OBSTACLES

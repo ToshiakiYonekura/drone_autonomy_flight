@@ -370,14 +370,14 @@ class ArduPilotMode99Env(gym.Env):
         origin_d = self._mode99_ref[2]  # drone's altitude in NED (e.g. -43m)
         if self.mission_type == 'obstacle_avoidance':
             self.goal_position = np.array([
-                origin_ne[0] + self.np_random.uniform(20, 50),
+                origin_ne[0] + self.np_random.uniform(10, 25),
                 origin_ne[1] + self.np_random.uniform(-10, 10),
                 origin_d + self.np_random.uniform(-5, 5)  # same altitude ±5m
             ], dtype=np.float32)
         else:  # waypoint_navigation
             self.goal_position = np.array([
-                origin_ne[0] + self.np_random.uniform(-50, 50),
-                origin_ne[1] + self.np_random.uniform(-50, 50),
+                origin_ne[0] + self.np_random.uniform(-25, 25),
+                origin_ne[1] + self.np_random.uniform(-25, 25),
                 origin_d + self.np_random.uniform(-5, 5)  # same altitude ±5m
             ], dtype=np.float32)
         self._obstacles = []
@@ -536,7 +536,7 @@ class ArduPilotMode99Env(gym.Env):
         obstacles = obs[15:21]  # Extract obstacle distances
         for obstacle_dist in obstacles:
             if obstacle_dist < 5.0:
-                reward -= 10.0 * np.exp(-obstacle_dist)
+                reward -= 2.0 * np.exp(-obstacle_dist)
 
         # 4. Crash detection (any obstacle < 1m)
         if np.any(obstacles < 1.0):
@@ -557,7 +557,14 @@ class ArduPilotMode99Env(gym.Env):
         tilt = np.sqrt(roll**2 + pitch**2)  # combined tilt angle (rad)
         max_tilt = 0.174  # ~10 degrees in radians
         if tilt > max_tilt:
-            reward -= 20.0 * (tilt - max_tilt)
+            reward -= 5.0 * (tilt - max_tilt)
+
+        # 8. Altitude maintenance bonus (stay within 3m of target altitude)
+        current_alt = -obs[2]  # NED z → altitude (positive = up)
+        target_alt = -self._mode99_ref[2]
+        alt_error = abs(current_alt - target_alt)
+        if alt_error < 3.0:
+            reward += 0.1
 
         return reward
 
