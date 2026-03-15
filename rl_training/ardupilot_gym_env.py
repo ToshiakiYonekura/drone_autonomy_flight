@@ -105,8 +105,8 @@ class ArduPilotMode99Env(gym.Env):
         # delta_D > 0 = lower target altitude, delta_D < 0 = raise target altitude (NED)
         # Velocity reference is always ZERO → LQR drives velocity to zero → no flip
         self.action_space = spaces.Box(
-            low=np.array([-2.0, -2.0, -1.0, -0.3]),
-            high=np.array([2.0, 2.0, 1.0, 0.3]),
+            low=np.array([-1.0, -1.0, -0.5, -0.3]),
+            high=np.array([1.0, 1.0, 0.5, 0.3]),
             shape=(4,),
             dtype=np.float32
         )
@@ -422,11 +422,16 @@ class ArduPilotMode99Env(gym.Env):
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
         # Integrated position target: target moves independently of drone position
-        # This prevents the target from drifting away with the drone at high speed.
         # LQR sees a fixed target → drives velocity to zero → no runaway acceleration.
+        # Speed gate: only advance the target when horizontal speed is manageable.
+        # If drone is already flying fast, hold the current target so LQR decelerates.
         # action[0]=delta_N, action[1]=delta_E, action[2]=delta_D, action[3]=yaw_rate
-        self._target_pos[0] += action[0]
-        self._target_pos[1] += action[1]
+        current_vel = self.telemetry['velocity']
+        horiz_speed = np.sqrt(current_vel[0]**2 + current_vel[1]**2)
+        MAX_SPEED_FOR_TARGET_UPDATE = 3.0  # m/s — above this, hold target and decelerate
+        if horiz_speed < MAX_SPEED_FOR_TARGET_UPDATE:
+            self._target_pos[0] += action[0]
+            self._target_pos[1] += action[1]
         self._target_pos[2] += action[2]
         # Clamp target altitude: keep within ±10m of takeoff altitude (NED: D is negative)
         # ref_d ≈ -43m → clamp to [-53m, -33m] (53m max, 33m min altitude)
