@@ -100,13 +100,14 @@ class ArduPilotMode99Env(gym.Env):
             dtype=np.float32
         )
 
-        # Action space: 3D continuous
-        # [delta_x, delta_y, yaw_rate] relative to current position
-        # z (altitude) is NOT controlled by RL — Mode 99 maintains takeoff altitude
+        # Action space: 4D continuous
+        # [delta_N, delta_E, delta_D, yaw_rate] — position OFFSETS from current position (meters)
+        # delta_D > 0 = lower target altitude, delta_D < 0 = raise target altitude (NED)
+        # Velocity reference is always ZERO → no velocity error → no flip instability
         self.action_space = spaces.Box(
-            low=np.array([-5.0, -5.0, -3.0]),
-            high=np.array([5.0, 5.0, 3.0]),
-            shape=(3,),
+            low=np.array([-0.5, -0.5, -0.5, -0.3]),
+            high=np.array([0.5, 0.5, 0.5, 0.3]),
+            shape=(4,),
             dtype=np.float32
         )
 
@@ -116,10 +117,11 @@ class ArduPilotMode99Env(gym.Env):
 
         # Episode state
         self.current_step = 0
-        self.prev_action = np.zeros(3)
+        self.prev_action = np.zeros(4)
         self.goal_position = np.zeros(3)
         self.start_position = np.zeros(3)
         self.episode_reward = 0.0
+        self._target_pos_ne = np.zeros(2)  # integrated position target (N, E)
 
         # Telemetry data
         self.telemetry = {
@@ -212,7 +214,8 @@ class ArduPilotMode99Env(gym.Env):
         # Reset episode counters
         self.current_step = 0
         self.episode_reward = 0.0
-        self.prev_action = np.zeros(3)
+        self.prev_action = np.zeros(4)
+        self._target_pos_ne = np.zeros(2)  # reset; will be set after M99_REF capture
 
         # Goal and obstacles are placed after M99_REF capture below,
         # relative to the drone's actual episode-start position.
@@ -345,7 +348,7 @@ class ArduPilotMode99Env(gym.Env):
             pos = self.telemetry['position']
             vel = self.telemetry['velocity']
             # Only require valid altitude (above 5m) and low vertical velocity
-            if pos[2] < -5.0 and abs(vel[2]) < 0.5:
+            if pos[2] < -5.0 and abs(vel[2]) < 0.1:
                 stable_count += 1
                 if stable_count >= 5:
                     # Update ref_d to actual stable altitude
@@ -362,6 +365,10 @@ class ArduPilotMode99Env(gym.Env):
                 self._mode99_ref[2] = pos[2]
                 ref_d = pos[2]
             print(f"  Stabilization timeout, using alt={-ref_d:.1f}m")
+
+        # Initialize integrated position target to drone's actual start position
+        start_pos = self.telemetry['position']
+        self._target_pos_ne = np.array([start_pos[0], start_pos[1]], dtype=np.float32)
 
         # Set goal and obstacles relative to drone's episode-start NE position.
         # This keeps training consistent regardless of how far the drone drifted
@@ -414,17 +421,23 @@ class ArduPilotMode99Env(gym.Env):
         # Clip action to valid range
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
-        # Send position/velocity/yaw command to Mode 99
-        # RL controls horizontal (N, E) only; z fixed at takeoff altitude
+        # Send position offset + current velocity as reference to Mode 99
+        # vel_ref = current velocity → velocity error ≈ 0 → no flip instability
+        # Position offset provides navigation direction
+        # action[0]=delta_N, action[1]=delta_E, action[2]=delta_D, action[3]=yaw_rate
         current_pos = self.telemetry['position']
-        target_pos = np.array([
-            current_pos[0] + action[0],   # delta_N
-            current_pos[1] + action[1],   # delta_E
-            self._mode99_ref[2]            # z fixed at takeoff altitude
+        current_vel = self.telemetry['velocity']
+        hold_pos = np.array([
+            current_pos[0] + action[0],
+            current_pos[1] + action[1],
+            current_pos[2] + action[2]
         ], dtype=np.float32)
+        # Pass current velocity as reference — eliminates velocity error term → no flip
+        cmd_vel = np.array([current_vel[0], current_vel[1], current_vel[2]], dtype=np.float32)
         self.send_position_target(
-            position=target_pos,
-            yaw_rate=action[2]
+            position=hold_pos,
+            velocity=cmd_vel,
+            yaw_rate=action[3]
         )
 
         # Log altitude every 100 steps to track trajectory
@@ -432,7 +445,11 @@ class ArduPilotMode99Env(gym.Env):
             pos = self.telemetry['position']
             vel = self.telemetry['velocity']
             mode = self.telemetry['mode']
-            print(f"  [step {self.current_step:4d}] alt={-pos[2]:.1f}m vel_z={vel[2]:.1f}m/s mode={mode} target_z={target_pos[2]:.1f}")
+            lqi_thrust = self.telemetry['lqi_diag'].get('LQI_Thrust', float('nan'))
+            att = self.telemetry['attitude']
+            tilt_deg = np.degrees(np.sqrt(att[0]**2 + att[1]**2))
+            speed_h = np.sqrt(vel[0]**2 + vel[1]**2)
+            print(f"  [step {self.current_step:4d}] alt={-pos[2]:.1f}m vel_z={vel[2]:.2f} spd_h={speed_h:.1f}m/s mode={mode} dpos=({action[0]:.2f},{action[1]:.2f},{action[2]:.2f}) thrust={lqi_thrust:.1f}N tilt={tilt_deg:.1f}°")
 
         # Wait for control period (20Hz = 50ms)
         time.sleep(0.05 / self.time_scale)
@@ -559,10 +576,11 @@ class ArduPilotMode99Env(gym.Env):
         if tilt > max_tilt:
             reward -= 8.0 * (tilt - max_tilt)
 
-        # 8. Altitude maintenance bonus (stay within 3m of target altitude)
+        # 8. Altitude maintenance (penalty for error + bonus for being close)
         current_alt = -obs[2]  # NED z → altitude (positive = up)
         target_alt = -self._mode99_ref[2]
         alt_error = abs(current_alt - target_alt)
+        reward -= 0.5 * alt_error
         if alt_error < 3.0:
             reward += 0.1
 
