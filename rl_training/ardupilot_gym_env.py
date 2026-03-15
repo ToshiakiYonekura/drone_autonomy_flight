@@ -339,22 +339,23 @@ class ArduPilotMode99Env(gym.Env):
         self._mode99_ref = np.array([ref_n, ref_e, ref_d], dtype=np.float32)
         print(f"  Mode 99 reference: N={ref_n:.2f} E={ref_e:.2f} D={ref_d:.2f} (alt={-ref_d:.2f}m)")
 
-        # Wait for drone to stabilize (low vertical velocity) before starting episode
+        # Wait for drone to stabilize (low vertical AND horizontal velocity) before starting episode
         # Then use the actual stable altitude as target_z (not mode99_ref which may differ)
         print("  Waiting for altitude stabilization...")
         stable_count = 0
-        for _ in range(200):  # max 10s real time
+        for _ in range(400):  # max 20s real time (extended for horizontal speed settling)
             self.update_telemetry()
             pos = self.telemetry['position']
             vel = self.telemetry['velocity']
-            # Only require valid altitude (above 5m) and low vertical velocity
-            if pos[2] < -5.0 and abs(vel[2]) < 0.1:
+            horiz_speed = np.sqrt(vel[0]**2 + vel[1]**2)
+            # Require valid altitude, low vertical velocity, AND low horizontal speed
+            if pos[2] < -5.0 and abs(vel[2]) < 0.1 and horiz_speed < 1.0:
                 stable_count += 1
                 if stable_count >= 5:
                     # Update ref_d to actual stable altitude
                     self._mode99_ref[2] = pos[2]
                     ref_d = pos[2]
-                    print(f"  Stabilized at alt={-pos[2]:.1f}m vel_z={vel[2]:.2f}m/s")
+                    print(f"  Stabilized at alt={-pos[2]:.1f}m vel_z={vel[2]:.2f}m/s horiz={horiz_speed:.2f}m/s")
                     break
             else:
                 stable_count = 0
@@ -428,28 +429,32 @@ class ArduPilotMode99Env(gym.Env):
         # This keeps the LQR velocity error small regardless of drone speed.
         # action[0]=delta_N, action[1]=delta_E, action[2]=delta_D, action[3]=yaw_rate
         current_pos = self.telemetry['position']
-        self._target_pos[0] += action[0]
-        self._target_pos[1] += action[1]
+        current_vel = self.telemetry['velocity']
+        horiz_speed = np.sqrt(current_vel[0]**2 + current_vel[1]**2)
+
+        # Speed gate: if drone is moving too fast, freeze target to avoid further acceleration.
+        # At high speeds, adding more target delta would cause the LQR to push harder → more tilt.
+        # Instead, keep target at current drone position so LQR commands "stop here".
+        MAX_GATE_SPEED = 5.0  # m/s: above this, freeze the target
+        if horiz_speed > MAX_GATE_SPEED:
+            # Freeze N/E target at current drone position; still allow altitude action
+            self._target_pos[0] = current_pos[0]
+            self._target_pos[1] = current_pos[1]
+        else:
+            self._target_pos[0] += action[0]
+            self._target_pos[1] += action[1]
         self._target_pos[2] += action[2]
         # Clamp target altitude: keep within ±10m of takeoff altitude (NED: D is negative)
         ref_d = self._mode99_ref[2]
         self._target_pos[2] = np.clip(self._target_pos[2], ref_d - 10.0, ref_d + 10.0)
 
-        # Velocity feedforward: proportional to vector from drone to target, capped at 2 m/s
-        # When close to target: small vel_ref → smooth stop
-        # When far from target: 2 m/s approach speed → LQR velocity error stays small
-        MAX_APPROACH_VEL = 2.0  # m/s
-        vec_to_target = self._target_pos - current_pos
-        dist_to_target = np.linalg.norm(vec_to_target[:2])
-        if dist_to_target > 0.1:
-            desired_vel_horiz = vec_to_target[:2] / dist_to_target * min(dist_to_target * 0.5, MAX_APPROACH_VEL)
-        else:
-            desired_vel_horiz = np.zeros(2)
-        vel_ref = np.array([desired_vel_horiz[0], desired_vel_horiz[1], 0.0], dtype=np.float32)
-
+        # vel_ref = 0: let the LQR drive velocity purely from position error.
+        # With Q[pos]=0.005 (small), position gain is low enough that the drone
+        # won't overshoot violently. Adding vel_ref toward target was making things
+        # worse: both pos_err AND vel_err pushed in the same direction → double tilt.
         self.send_position_target(
             position=self._target_pos.copy(),
-            velocity=vel_ref,
+            velocity=np.zeros(3, dtype=np.float32),
             yaw_rate=action[3]
         )
 
@@ -490,6 +495,8 @@ class ArduPilotMode99Env(gym.Env):
             vel = self.telemetry['velocity']
             speed = np.linalg.norm(vel)
             goal = self.goal_position
+            att_end = self.telemetry['attitude']
+            tilt_at_end = np.sqrt(att_end[0]**2 + att_end[1]**2)
             print(f"  pos=({pos[0]:.1f}, {pos[1]:.1f}, {pos[2]:.1f}) "
                   f"vel=({vel[0]:.1f}, {vel[1]:.1f}, {vel[2]:.1f}) speed={speed:.1f}m/s "
                   f"goal=({goal[0]:.1f}, {goal[1]:.1f}, {goal[2]:.1f})")
@@ -499,6 +506,8 @@ class ArduPilotMode99Env(gym.Env):
                 print(f"💥 CRASH! step={self.current_step} reward={self.episode_reward:.1f}")
             elif self.telemetry['position'][2] > -5.0:
                 print(f"🌍 GROUND! step={self.current_step} reward={self.episode_reward:.1f}")
+            elif tilt_at_end > np.radians(45.0):
+                print(f"↗️ FLIP! step={self.current_step} reward={self.episode_reward:.1f} tilt={np.degrees(tilt_at_end):.1f}°")
             elif not self.telemetry['armed']:
                 print(f"⚠️ DISARMED! step={self.current_step} reward={self.episode_reward:.1f}")
             else:
@@ -589,6 +598,9 @@ class ArduPilotMode99Env(gym.Env):
         max_tilt = 0.174  # ~10 degrees in radians
         if tilt > max_tilt:
             reward -= 8.0 * (tilt - max_tilt)
+        # Hard penalty for extreme tilt (> 45°): approaching flip
+        if tilt > np.radians(45.0):
+            reward -= 200.0
 
         # 8. Altitude maintenance (penalty for error + bonus for being close)
         current_alt = -obs[2]  # NED z → altitude (positive = up)
@@ -613,6 +625,12 @@ class ArduPilotMode99Env(gym.Env):
 
         # Ground contact (altitude below 5m)
         if self.telemetry['position'][2] > -5.0:
+            return True
+
+        # Excessive tilt (> 45°): drone entering flip / unrecoverable state
+        att = self.telemetry['attitude']
+        tilt = np.sqrt(att[0]**2 + att[1]**2)
+        if tilt > np.radians(45.0):
             return True
 
         # Disarmed unexpectedly

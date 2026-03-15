@@ -132,7 +132,7 @@ if [ -n "$RESUME" ]; then
     echo "  Resuming from: $RESUME_ABS"
 fi
 
-python3 train_mode99_rl.py \
+python3 -u train_mode99_rl.py \
     --mode train \
     --mission "$MISSION" \
     --timesteps "$TIMESTEPS" \
