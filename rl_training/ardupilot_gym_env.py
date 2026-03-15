@@ -421,24 +421,35 @@ class ArduPilotMode99Env(gym.Env):
         # Clip action to valid range
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
-        # Integrated position target: target moves independently of drone position
-        # LQR sees a fixed target → drives velocity to zero → no runaway acceleration.
-        # Speed gate: only advance the target when horizontal speed is manageable.
-        # If drone is already flying fast, hold the current target so LQR decelerates.
+        # Integrated position target + velocity feedforward
+        # The key insight: LQR gains are tuned for small perturbations near hover.
+        # Sending vel_ref=0 with a drone at 10 m/s creates huge velocity error → 90°+ tilt.
+        # Fix: send vel_ref = proportional velocity toward the target (capped at MAX_VEL).
+        # This keeps the LQR velocity error small regardless of drone speed.
         # action[0]=delta_N, action[1]=delta_E, action[2]=delta_D, action[3]=yaw_rate
-        current_vel = self.telemetry['velocity']
-        horiz_speed = np.sqrt(current_vel[0]**2 + current_vel[1]**2)
-        MAX_SPEED_FOR_TARGET_UPDATE = 3.0  # m/s — above this, hold target and decelerate
-        if horiz_speed < MAX_SPEED_FOR_TARGET_UPDATE:
-            self._target_pos[0] += action[0]
-            self._target_pos[1] += action[1]
+        current_pos = self.telemetry['position']
+        self._target_pos[0] += action[0]
+        self._target_pos[1] += action[1]
         self._target_pos[2] += action[2]
         # Clamp target altitude: keep within ±10m of takeoff altitude (NED: D is negative)
-        # ref_d ≈ -43m → clamp to [-53m, -33m] (53m max, 33m min altitude)
         ref_d = self._mode99_ref[2]
         self._target_pos[2] = np.clip(self._target_pos[2], ref_d - 10.0, ref_d + 10.0)
+
+        # Velocity feedforward: proportional to vector from drone to target, capped at 2 m/s
+        # When close to target: small vel_ref → smooth stop
+        # When far from target: 2 m/s approach speed → LQR velocity error stays small
+        MAX_APPROACH_VEL = 2.0  # m/s
+        vec_to_target = self._target_pos - current_pos
+        dist_to_target = np.linalg.norm(vec_to_target[:2])
+        if dist_to_target > 0.1:
+            desired_vel_horiz = vec_to_target[:2] / dist_to_target * min(dist_to_target * 0.5, MAX_APPROACH_VEL)
+        else:
+            desired_vel_horiz = np.zeros(2)
+        vel_ref = np.array([desired_vel_horiz[0], desired_vel_horiz[1], 0.0], dtype=np.float32)
+
         self.send_position_target(
             position=self._target_pos.copy(),
+            velocity=vel_ref,
             yaw_rate=action[3]
         )
 
