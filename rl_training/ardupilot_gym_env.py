@@ -103,10 +103,10 @@ class ArduPilotMode99Env(gym.Env):
         # Action space: 4D continuous
         # [delta_N, delta_E, delta_D, yaw_rate] — position OFFSETS from current position (meters)
         # delta_D > 0 = lower target altitude, delta_D < 0 = raise target altitude (NED)
-        # Velocity reference is always ZERO → no velocity error → no flip instability
+        # Velocity reference is always ZERO → LQR drives velocity to zero → no flip
         self.action_space = spaces.Box(
-            low=np.array([-0.5, -0.5, -0.5, -0.3]),
-            high=np.array([0.5, 0.5, 0.5, 0.3]),
+            low=np.array([-2.0, -2.0, -1.0, -0.3]),
+            high=np.array([2.0, 2.0, 1.0, 0.3]),
             shape=(4,),
             dtype=np.float32
         )
@@ -421,22 +421,17 @@ class ArduPilotMode99Env(gym.Env):
         # Clip action to valid range
         action = np.clip(action, self.action_space.low, self.action_space.high)
 
-        # Send position offset + current velocity as reference to Mode 99
-        # vel_ref = current velocity → velocity error ≈ 0 → no flip instability
-        # Position offset provides navigation direction
+        # Send position offset to Mode 99
+        # vel_ref = 0 → LQR actively drives velocity to zero → stable hover at target
         # action[0]=delta_N, action[1]=delta_E, action[2]=delta_D, action[3]=yaw_rate
         current_pos = self.telemetry['position']
-        current_vel = self.telemetry['velocity']
         hold_pos = np.array([
             current_pos[0] + action[0],
             current_pos[1] + action[1],
             current_pos[2] + action[2]
         ], dtype=np.float32)
-        # Pass current velocity as reference — eliminates velocity error term → no flip
-        cmd_vel = np.array([current_vel[0], current_vel[1], current_vel[2]], dtype=np.float32)
         self.send_position_target(
             position=hold_pos,
-            velocity=cmd_vel,
             yaw_rate=action[3]
         )
 
