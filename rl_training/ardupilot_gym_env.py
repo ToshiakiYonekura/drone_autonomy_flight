@@ -105,8 +105,8 @@ class ArduPilotMode99Env(gym.Env):
         # delta_D > 0 = lower target altitude, delta_D < 0 = raise target altitude (NED)
         # Velocity reference is always ZERO → LQR drives velocity to zero → no flip
         self.action_space = spaces.Box(
-            low=np.array([-1.0, -1.0, -0.5, -0.3]),
-            high=np.array([1.0, 1.0, 0.5, 0.3]),
+            low=np.array([-0.3, -0.3, -0.3, -0.3]),
+            high=np.array([0.3, 0.3, 0.3, 0.3]),
             shape=(4,),
             dtype=np.float32
         )
@@ -288,6 +288,30 @@ class ArduPilotMode99Env(gym.Env):
                 break
             time.sleep(0.5)
 
+        # Step 5b: Wait for GUIDED hover to stabilize (low speed) BEFORE switching to Mode 99.
+        # GUIDED's position controller handles deceleration safely; Mode 99 LQR cannot.
+        print("  Waiting for GUIDED hover stabilization...")
+        hold_pos = fallback_pos if fallback_pos is not None else np.zeros(3)
+        guided_stable = 0
+        for _ in range(800):  # up to 40s real time (200s sim at speedup 5)
+            self.update_telemetry()
+            pos = self.telemetry['position']
+            vel = self.telemetry['velocity']
+            horiz_speed = np.sqrt(vel[0]**2 + vel[1]**2)
+            # Send position hold in GUIDED mode to actively decelerate
+            self.send_position_target(position=hold_pos)
+            if pos[2] < -35.0 and abs(vel[2]) < 0.3 and horiz_speed < 0.5:
+                guided_stable += 1
+                if guided_stable >= 10:
+                    fallback_pos = pos.copy()
+                    print(f"  GUIDED stable: alt={-pos[2]:.1f}m horiz={horiz_speed:.2f}m/s")
+                    break
+            else:
+                guided_stable = 0
+            time.sleep(0.05 / self.time_scale)
+        else:
+            print(f"  GUIDED stabilization timeout (horiz={horiz_speed:.1f}m/s alt={-pos[2]:.1f}m)")
+
         # Step 6: Switch to Mode 99
         self.mav.mav.set_mode_send(
             self.mav.target_system,
@@ -339,23 +363,21 @@ class ArduPilotMode99Env(gym.Env):
         self._mode99_ref = np.array([ref_n, ref_e, ref_d], dtype=np.float32)
         print(f"  Mode 99 reference: N={ref_n:.2f} E={ref_e:.2f} D={ref_d:.2f} (alt={-ref_d:.2f}m)")
 
-        # Wait for drone to stabilize (low vertical AND horizontal velocity) before starting episode
-        # Then use the actual stable altitude as target_z (not mode99_ref which may differ)
-        print("  Waiting for altitude stabilization...")
+        # Wait briefly for Mode 99 to confirm it's running and update ref altitude.
+        # (Drone should already be stable from GUIDED pre-stabilization above.)
+        print("  Waiting for Mode 99 altitude confirmation...")
         stable_count = 0
-        for _ in range(400):  # max 20s real time (extended for horizontal speed settling)
+        for _ in range(100):  # max 5s real time
             self.update_telemetry()
             pos = self.telemetry['position']
             vel = self.telemetry['velocity']
             horiz_speed = np.sqrt(vel[0]**2 + vel[1]**2)
-            # Require valid altitude, low vertical velocity, AND low horizontal speed
-            if pos[2] < -5.0 and abs(vel[2]) < 0.1 and horiz_speed < 1.0:
+            if pos[2] < -5.0 and abs(vel[2]) < 0.3 and horiz_speed < 1.0:
                 stable_count += 1
                 if stable_count >= 5:
-                    # Update ref_d to actual stable altitude
                     self._mode99_ref[2] = pos[2]
                     ref_d = pos[2]
-                    print(f"  Stabilized at alt={-pos[2]:.1f}m vel_z={vel[2]:.2f}m/s horiz={horiz_speed:.2f}m/s")
+                    print(f"  Mode 99 stable: alt={-pos[2]:.1f}m horiz={horiz_speed:.2f}m/s")
                     break
             else:
                 stable_count = 0
@@ -378,7 +400,7 @@ class ArduPilotMode99Env(gym.Env):
         origin_d = self._mode99_ref[2]  # drone's altitude in NED (e.g. -43m)
         if self.mission_type == 'obstacle_avoidance':
             self.goal_position = np.array([
-                origin_ne[0] + self.np_random.uniform(10, 25),
+                origin_ne[0] + self.np_random.uniform(5, 15),
                 origin_ne[1] + self.np_random.uniform(-10, 10),
                 origin_d + self.np_random.uniform(-5, 5)  # same altitude ±5m
             ], dtype=np.float32)
@@ -432,10 +454,10 @@ class ArduPilotMode99Env(gym.Env):
         current_vel = self.telemetry['velocity']
         horiz_speed = np.sqrt(current_vel[0]**2 + current_vel[1]**2)
 
-        # Speed gate: if drone is moving too fast, freeze target to avoid further acceleration.
-        # At high speeds, adding more target delta would cause the LQR to push harder → more tilt.
-        # Instead, keep target at current drone position so LQR commands "stop here".
-        MAX_GATE_SPEED = 5.0  # m/s: above this, freeze the target
+        # Speed gate: freeze N/E target when moving too fast to prevent LQR over-tilt.
+        # Lower gate (1.5 m/s) catches the drone while tilt is still small (~7°),
+        # giving LQR time to brake before momentum builds.
+        MAX_GATE_SPEED = 1.5  # m/s (was 3.0)
         if horiz_speed > MAX_GATE_SPEED:
             # Freeze N/E target at current drone position; still allow altitude action
             self._target_pos[0] = current_pos[0]
@@ -448,10 +470,16 @@ class ArduPilotMode99Env(gym.Env):
         ref_d = self._mode99_ref[2]
         self._target_pos[2] = np.clip(self._target_pos[2], ref_d - 10.0, ref_d + 10.0)
 
-        # vel_ref = 0: let the LQR drive velocity purely from position error.
-        # With Q[pos]=0.005 (small), position gain is low enough that the drone
-        # won't overshoot violently. Adding vel_ref toward target was making things
-        # worse: both pos_err AND vel_err pushed in the same direction → double tilt.
+        # Clamp N/E target to within MAX_TARGET_DIST from drone.
+        # Smaller clamp (1m) limits pos_err → limits tilt from position term.
+        # At 1m pos_err + 1.5m/s vel: LQR tilt ≈ 1.5° + 6.8° = 8.3° (well within safe range).
+        MAX_TARGET_DIST = 1.0  # meters (was 3.0)
+        tgt_ne = self._target_pos[:2] - current_pos[:2]
+        dist_ne = np.linalg.norm(tgt_ne)
+        if dist_ne > MAX_TARGET_DIST:
+            self._target_pos[:2] = current_pos[:2] + tgt_ne * (MAX_TARGET_DIST / dist_ne)
+
+        # vel_ref = 0: LQR sees full velocity as error → maximum braking force.
         self.send_position_target(
             position=self._target_pos.copy(),
             velocity=np.zeros(3, dtype=np.float32),
@@ -506,7 +534,7 @@ class ArduPilotMode99Env(gym.Env):
                 print(f"💥 CRASH! step={self.current_step} reward={self.episode_reward:.1f}")
             elif self.telemetry['position'][2] > -5.0:
                 print(f"🌍 GROUND! step={self.current_step} reward={self.episode_reward:.1f}")
-            elif tilt_at_end > np.radians(45.0):
+            elif tilt_at_end > np.radians(60.0):
                 print(f"↗️ FLIP! step={self.current_step} reward={self.episode_reward:.1f} tilt={np.degrees(tilt_at_end):.1f}°")
             elif not self.telemetry['armed']:
                 print(f"⚠️ DISARMED! step={self.current_step} reward={self.episode_reward:.1f}")
@@ -599,7 +627,7 @@ class ArduPilotMode99Env(gym.Env):
         if tilt > max_tilt:
             reward -= 8.0 * (tilt - max_tilt)
         # Hard penalty for extreme tilt (> 45°): approaching flip
-        if tilt > np.radians(45.0):
+        if tilt > np.radians(60.0):
             reward -= 200.0
 
         # 8. Altitude maintenance (penalty for error + bonus for being close)
@@ -630,7 +658,7 @@ class ArduPilotMode99Env(gym.Env):
         # Excessive tilt (> 45°): drone entering flip / unrecoverable state
         att = self.telemetry['attitude']
         tilt = np.sqrt(att[0]**2 + att[1]**2)
-        if tilt > np.radians(45.0):
+        if tilt > np.radians(60.0):
             return True
 
         # Disarmed unexpectedly

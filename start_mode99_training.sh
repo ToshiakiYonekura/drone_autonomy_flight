@@ -65,6 +65,17 @@ echo "  Timesteps:    $TIMESTEPS"
 echo "  ArduPilot:    $ARDUPILOT_DIR"
 echo "======================================================================"
 
+# Copy lqr_gains.txt to SITL working directory so Mode 99 loads DARE gains instead of heuristic
+LQR_GAINS_SRC="$ARDUPILOT_DIR/ArduCopter/lqr_gains.txt"
+if [ -f "$LQR_GAINS_SRC" ]; then
+    cp "$LQR_GAINS_SRC" "$WORKSPACE_DIR/lqr_gains.txt"
+    mkdir -p /tmp/sitl_cowork
+    cp "$LQR_GAINS_SRC" /tmp/sitl_cowork/lqr_gains.txt
+    echo "✅ lqr_gains.txt copied to SITL working directory"
+else
+    echo "⚠️  lqr_gains.txt not found at $LQR_GAINS_SRC — Mode 99 will use heuristic gains"
+fi
+
 echo ""
 echo "Starting SITL (arducopter binary directly, port $SITL_PORT)..."
 "$ARDUPILOT_DIR/build/sitl/bin/arducopter" \
