@@ -111,8 +111,8 @@ class ArduPilotMode99Env(gym.Env):
         # delta_D > 0 = lower target altitude, delta_D < 0 = raise target altitude (NED)
         # Velocity reference is always ZERO → LQR drives velocity to zero → no flip
         self.action_space = spaces.Box(
-            low=np.array([-0.3, -0.3, -0.3, -0.3]),
-            high=np.array([0.3, 0.3, 0.3, 0.3]),
+            low=np.array([-0.15, -0.15, -0.15, -0.15]),
+            high=np.array([0.15, 0.15, 0.15, 0.15]),
             shape=(4,),
             dtype=np.float32
         )
@@ -124,6 +124,7 @@ class ArduPilotMode99Env(gym.Env):
         # Episode state
         self.current_step = 0
         self.prev_action = np.zeros(4)
+        self.prev_goal_dist = None
         self.goal_position = np.zeros(3)
         self.start_position = np.zeros(3)
         self.episode_reward = 0.0
@@ -221,6 +222,7 @@ class ArduPilotMode99Env(gym.Env):
         self.current_step = 0
         self.episode_reward = 0.0
         self.prev_action = np.zeros(4)
+        self.prev_goal_dist = None
         self._target_pos = np.zeros(3)  # reset; will be set after M99_REF capture
 
         # Goal and obstacles are placed after M99_REF capture below,
@@ -551,8 +553,9 @@ class ArduPilotMode99Env(gym.Env):
         # Additional info
         info = self.get_info()
 
-        # Store previous action for smoothness penalty
+        # Store previous action and goal dist for next step
         self.prev_action = action.copy()
+        self.prev_goal_dist = np.linalg.norm(self.goal_position - self.telemetry['position'])
 
         return obs, reward, terminated, truncated, info
 
@@ -654,6 +657,24 @@ class ArduPilotMode99Env(gym.Env):
         if alt_error < 3.0:
             reward += 0.1
 
+        # 9. Attitude stability bonus (level flight reward)
+        if tilt < 0.1:  # ~6° 以内
+            reward += 0.5
+
+        # 10. Progress bonus (approaching goal)
+        if self.prev_goal_dist is not None:
+            dist_improvement = self.prev_goal_dist - goal_dist
+            if dist_improvement > 0:
+                reward += 1.0 * dist_improvement
+
+        # 11. Velocity toward goal bonus
+        velocity = obs[3:6]
+        if goal_dist > 1e-6:
+            goal_dir = goal_relative / goal_dist
+            vel_toward_goal = np.dot(velocity, goal_dir)
+            if vel_toward_goal > 0:
+                reward += 0.3 * vel_toward_goal
+
         return reward
 
     def is_terminated(self) -> bool:
@@ -687,8 +708,10 @@ class ArduPilotMode99Env(gym.Env):
         """Get additional information"""
         goal_relative = self.goal_position - self.telemetry['position']
 
+        goal_dist = np.linalg.norm(goal_relative)
         return {
-            'goal_distance': np.linalg.norm(goal_relative),
+            'goal_distance': goal_dist,
+            'goal_reached': goal_dist < self.goal_radius,
             'min_obstacle_dist': np.min(self.telemetry['obstacles']),
             'episode_reward': self.episode_reward,
             'current_step': self.current_step,

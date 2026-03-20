@@ -165,7 +165,8 @@ import sys; sys.path.insert(0, '.')
 from ardupilot_gym_env import ArduPilotMode99Env
 import inspect, re
 src = inspect.getsource(ArduPilotMode99Env.__init__)
-m = re.search(r'shape=\((\d+),\)', src)
+# action_space の定義以降で最初に出る shape=(N,) を取得
+m = re.search(r'action_space.*?shape=\((\d+),\)', src, re.DOTALL)
 print(m.group(1) if m else '?')
 " 2>/dev/null)
     echo "  Model action_dim=$ACTION_DIM  Env action_dim=$ENV_DIM"

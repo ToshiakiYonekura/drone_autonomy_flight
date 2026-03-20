@@ -7,12 +7,34 @@ Train PPO agent for autonomous obstacle avoidance and waypoint navigation
 
 import argparse
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 import torch
 import os
 from ardupilot_gym_env import ArduPilotMode99Env
+
+
+class GoalStatsCallback(BaseCallback):
+    """Record goal reached count/rate and episode end reasons to TensorBoard."""
+
+    def __init__(self, verbose=0):
+        super().__init__(verbose)
+        self._goals = 0
+        self._episodes = 0
+
+    def _on_step(self) -> bool:
+        for info in self.locals.get('infos', []):
+            if info.get('goal_reached', False):
+                self._goals += 1
+            # Monitor wraps the env and adds 'episode' key at episode end
+            if 'episode' in info:
+                self._episodes += 1
+                rate = self._goals / self._episodes if self._episodes > 0 else 0.0
+                self.logger.record('custom/goals_reached_total', self._goals)
+                self.logger.record('custom/episodes_total', self._episodes)
+                self.logger.record('custom/goal_rate', rate)
+        return True
 
 
 def make_env(rank: int, seed: int = 0, mission_type: str = 'obstacle_avoidance',
@@ -121,6 +143,7 @@ def train_ppo(
         save_path=save_dir,
         name_prefix=f'ppo_{mission_type}'
     )
+    goal_stats_callback = GoalStatsCallback()
 
     # Create or load PPO model
     if resume_path:
@@ -160,7 +183,7 @@ def train_ppo(
     try:
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[checkpoint_callback],
+            callback=[checkpoint_callback, goal_stats_callback],
             progress_bar=True,
             reset_num_timesteps=not is_resume
         )
